@@ -173,6 +173,9 @@ static int probe_bcachefs(blkid_probe pr, const struct blkid_idmag *mag)
 	if (le64_to_cpu(bcs->offset) != BCACHE_SB_OFF / SECTOR_SIZE)
 		return BLKID_PROBE_NONE;
 
+	if (bcs->nr_devices == 0 || bcs->dev_idx >= bcs->nr_devices)
+		return BLKID_PROBE_NONE;
+
 	blkid_probe_set_uuid(pr, bcs->user_uuid);
 	blkid_probe_set_label(pr, bcs->label, sizeof(bcs->label));
 	blkid_probe_sprintf_version(pr, "%d", le16_to_cpu(bcs->version));

@@ -18,6 +18,7 @@
  * along with this program; if not, write to the Free Software Foundation,
  * Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  */
+#include <stdalign.h>
 #include <arpa/inet.h>		/* inet_ntop */
 #include <netinet/in.h>		/* in6_addr */
 #include <fcntl.h>		/* open(2) */
@@ -33,6 +34,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <sys/socket.h>		/* SOCK_* */
+#include <linux/unix_diag.h>
+#include <linux/sock_diag.h>
+#include <linux/netlink_diag.h>
+#include <linux/packet_diag.h>
+#include <linux/inet_diag.h>
+#include <linux/rtnetlink.h>
 
 #include "xalloc.h"
 #include "nls.h"
@@ -45,17 +52,17 @@
 
 static void load_xinfo_from_proc_icmp(ino_t netns_inode);
 static void load_xinfo_from_proc_icmp6(ino_t netns_inode);
-static void load_xinfo_from_proc_unix(ino_t netns_inode);
-static void load_xinfo_from_proc_raw(ino_t netns_inode);
-static void load_xinfo_from_proc_tcp(ino_t netns_inode);
-static void load_xinfo_from_proc_udp(ino_t netns_inode);
-static void load_xinfo_from_proc_udplite(ino_t netns_inode);
-static void load_xinfo_from_proc_tcp6(ino_t netns_inode);
-static void load_xinfo_from_proc_udp6(ino_t netns_inode);
-static void load_xinfo_from_proc_udplite6(ino_t netns_inode);
-static void load_xinfo_from_proc_raw6(ino_t netns_inode);
-static void load_xinfo_from_proc_netlink(ino_t netns_inode);
-static void load_xinfo_from_proc_packet(ino_t netns_inode);
+static void load_xinfo_from_diag_unix(int netlink_fd, ino_t netns_inode);
+static void load_xinfo_from_diag_raw(int netlink_fd, ino_t netns_inode);
+static void load_xinfo_from_diag_tcp(int netlink_fd, ino_t netns_inode);
+static void load_xinfo_from_diag_udp(int netlink_fd, ino_t netns_inode);
+static void load_xinfo_from_diag_udplite(int netlink_fd, ino_t netns_inode);
+static void load_xinfo_from_diag_tcp6(int netlink_id, ino_t netns_inode);
+static void load_xinfo_from_diag_udp6(int netlink_id, ino_t netns_inode);
+static void load_xinfo_from_diag_udplite6(int netlink_id, ino_t netns_inode);
+static void load_xinfo_from_diag_raw6(int netlink_fd, ino_t netns_inode);
+static void load_xinfo_from_diag_netlink(int netlink_fd, ino_t netns_inode);
+static void load_xinfo_from_diag_packet(int netlink_fd, ino_t netns_inode);
 
 static int self_netns_fd = -1;
 static struct stat self_netns_sb;
@@ -155,21 +162,29 @@ static struct netns *mark_sock_xinfo_loaded(ino_t ino)
 
 static void load_sock_xinfo_no_nsswitch(struct netns *nsobj)
 {
+	int netlink_fd;
 	ino_t netns = nsobj? nsobj->inode: 0;
 
-	load_xinfo_from_proc_unix(netns);
-	load_xinfo_from_proc_tcp(netns);
-	load_xinfo_from_proc_udp(netns);
-	load_xinfo_from_proc_udplite(netns);
-	load_xinfo_from_proc_raw(netns);
-	load_xinfo_from_proc_tcp6(netns);
-	load_xinfo_from_proc_udp6(netns);
-	load_xinfo_from_proc_udplite6(netns);
-	load_xinfo_from_proc_raw6(netns);
 	load_xinfo_from_proc_icmp(netns);
 	load_xinfo_from_proc_icmp6(netns);
-	load_xinfo_from_proc_netlink(netns);
-	load_xinfo_from_proc_packet(netns);
+
+	netlink_fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_SOCK_DIAG);
+
+	if (netlink_fd > 0) {
+		load_xinfo_from_diag_unix(netlink_fd, netns);
+		load_xinfo_from_diag_netlink(netlink_fd, netns);
+		load_xinfo_from_diag_packet(netlink_fd, netns);
+		load_xinfo_from_diag_tcp(netlink_fd, netns);
+		load_xinfo_from_diag_tcp6(netlink_fd, netns);
+		load_xinfo_from_diag_udp(netlink_fd, netns);
+		load_xinfo_from_diag_udp6(netlink_fd, netns);
+		load_xinfo_from_diag_udplite(netlink_fd, netns);
+		load_xinfo_from_diag_udplite6(netlink_fd, netns);
+		load_xinfo_from_diag_raw(netlink_fd, netns);
+		load_xinfo_from_diag_raw6(netlink_fd, netns);
+
+		close(netlink_fd);
+	}
 
 	if (nsobj)
 		load_ifaces_from_getifaddrs(nsobj);
@@ -435,60 +450,116 @@ static const struct sock_xinfo_class unix_xinfo_class = {
 	.free = NULL,
 };
 
-/* UNIX_LINE_LEN need at least 54 + 21 + UNIX_PATH_MAX + 1.
- *
- * An actual number must be used in this definition
- * since UNIX_LINE_LEN is specified as an argument for
- * stringify_value().
- */
-#define UNIX_LINE_LEN 256
-static void load_xinfo_from_proc_unix(ino_t netns_inode)
+static void send_diag_request(ino_t netns_inode, int fd, void *req, size_t req_size, void (*cb) (ino_t, size_t, void *))
 {
-	char line[UNIX_LINE_LEN];
-	FILE *unix_fp;
+	struct sockaddr_nl nladdr = {
+		.nl_family = AF_NETLINK,
+	};
 
-	unix_fp = fopen("/proc/net/unix", "r");
-	if (!unix_fp)
-		return;
+	struct nlmsghdr nlh = {
+		.nlmsg_len = sizeof(nlh) + req_size,
+		.nlmsg_type = SOCK_DIAG_BY_FAMILY,
+		.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP,
+	};
 
-	if (fgets(line, sizeof(line), unix_fp) == NULL)
-		goto out;
-	if (!(line[0] == 'N' && line[1] == 'u' && line[2] == 'm'))
-		/* Unexpected line */
-		goto out;
+	struct iovec iovecs[] = {
+		{ &nlh, sizeof(nlh) },
+		{ req, req_size },
+	};
 
-	while (fgets(line, sizeof(line), unix_fp)) {
-		uint64_t flags;
-		uint32_t type;
-		unsigned int st;
-		unsigned long inode;
-		struct unix_xinfo *ux;
-		char path[UNIX_LINE_LEN + 1] = { 0 };
+	const struct msghdr mhd = {
+		.msg_namelen = sizeof(nladdr),
+		.msg_name = &nladdr,
+		.msg_iovlen = ARRAY_SIZE(iovecs),
+		.msg_iov = iovecs,
+	};
 
+	if (sendmsg(fd, &mhd, 0) < 0)
+		exit(14);
 
-		if (sscanf(line, "%*x: %*x %*x %" SCNx64 " %x %x %lu %"
-			   stringify_value(UNIX_LINE_LEN) "[^\n]",
-			   &flags, &type, &st, &inode, path) < 4)
-			continue;
+	alignas(void *) uint8_t buf[8192];
 
-		if (inode == 0)
-			continue;
+	for (;;) {
+		int r = recvfrom(fd, buf, sizeof(buf), 0, NULL, NULL);
+		if (r < 0)
+			exit(15);
 
-		ux = xcalloc(1, sizeof(*ux));
-		ux->sock.class = &unix_xinfo_class;
-		ux->sock.inode = (ino_t)inode;
-		ux->sock.netns_inode = netns_inode;
+		const struct nlmsghdr *h = (void *) buf;
 
-		ux->acceptcon = !!flags;
-		ux->type = type;
-		ux->st = st;
-		xstrncpy(ux->path, path, sizeof(ux->path));
+		if (!NLMSG_OK(h, r))
+			exit(16);
 
-		add_sock_info(&ux->sock);
+		for (; NLMSG_OK(h, r); h = NLMSG_NEXT(h, r)) {
+			if (h->nlmsg_type == NLMSG_DONE) {
+//				exit(12);
+				return;
+				break;
+			}
+
+			if (h->nlmsg_type == NLMSG_ERROR) {
+				const struct nlmsgerr *err = NLMSG_DATA(h);
+				if (h->nlmsg_len < NLMSG_LENGTH(sizeof(*err))) {
+					exit(17);
+				} else {
+					printf("err %d\n", err->error);
+					exit(18);
+				}
+			}
+
+			if (h->nlmsg_type == SOCK_DIAG_BY_FAMILY) {
+				cb(netns_inode, h->nlmsg_len, NLMSG_DATA(h));
+			}
+		}
+	}
+}
+
+static void handle_diag_unix(ino_t netns_inode, size_t nlmsg_len, void *d)
+{
+	const struct unix_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
+
+	assert(diag->udiag_family == AF_UNIX);
+	size_t rta_len = nlmsg_len - NLMSG_LENGTH(sizeof(*diag));
+
+	struct unix_xinfo *ux;
+
+	ux = xcalloc(1, sizeof(*ux));
+	ux->sock.class = &unix_xinfo_class;
+	ux->sock.netns_inode = netns_inode;
+	ux->sock.inode = (ino_t) diag->udiag_ino;
+	ux->acceptcon = diag->udiag_state == 10;
+	ux->st = SS_UNCONNECTED;
+	if (diag->udiag_state == 1)
+		ux->st = SS_CONNECTED;
+	ux->type = diag->udiag_type;
+
+	for (struct rtattr *attr = (struct rtattr *)(diag + 1); RTA_OK(attr, rta_len); attr = RTA_NEXT(attr, rta_len)) {
+		switch (attr->rta_type) {
+		case UNIX_DIAG_NAME:
+			size_t x = RTA_PAYLOAD(attr);
+			char *name = RTA_DATA(attr);
+			if (!*name) {
+				name[0] = '@';
+				x++;
+			}
+
+			xstrncpy(ux->path, name, x);
+		}
 	}
 
- out:
-	fclose(unix_fp);
+	add_sock_info(&ux->sock);
+}
+
+static void load_xinfo_from_diag_unix(int netlink_fd, ino_t netns_inode)
+{
+	struct unix_diag_req udr = {
+		.sdiag_family = AF_UNIX,
+		.udiag_states = -1,
+		.udiag_show = UDIAG_SHOW_NAME,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_unix);
 }
 
 /*
@@ -717,44 +788,6 @@ static bool tcp_get_listening(struct sock_xinfo *sock_xinfo,
 		r;							\
 	})
 
-static struct sock_xinfo *tcp_xinfo_scan_line(const struct sock_xinfo_class *class,
-					      char * line,
-					      ino_t netns_inode,
-					      enum sysfs_byteorder byteorder)
-{
-	unsigned long local_addr;
-	unsigned long local_port;
-	unsigned long remote_addr;
-	unsigned long remote_port;
-	unsigned long st;
-	unsigned long long inode;
-	struct tcp_xinfo *tcp;
-	struct inet_xinfo *inet;
-	struct sock_xinfo *sock;
-
-	if (sscanf(line, "%*d: %lx:%lx %lx:%lx %lx %*x:%*x %*x:%*x %*x %*u %*u %lld",
-		   &local_addr, &local_port, &remote_addr, &remote_port,
-		   &st, &inode) != 6)
-		return NULL;
-
-	if (inode == 0)
-		return NULL;
-
-	tcp = xcalloc(1, sizeof(*tcp));
-	inet = &tcp->l4.inet;
-	sock = &inet->sock;
-	sock->class = class;
-	sock->inode = (ino_t)inode;
-	sock->netns_inode = netns_inode;
-	inet->local_addr.s_addr = kernel32_to_cpu(byteorder, local_addr);
-	tcp->local_port = local_port;
-	inet->remote_addr.s_addr = kernel32_to_cpu(byteorder, remote_addr);
-	tcp->remote_port = remote_port;
-	tcp->l4.st = st;
-
-	return sock;
-}
-
 static void *tcp_xinfo_get_addr(struct l4_xinfo *l4, enum l4_side side)
 {
 	return (side == L4_LOCAL)
@@ -788,7 +821,6 @@ static const struct l4_xinfo_class tcp_xinfo_class = {
 		.fill_column = tcp_fill_column,
 		.free = NULL,
 	},
-	.scan_line = tcp_xinfo_scan_line,
 	.get_addr = tcp_xinfo_get_addr,
 	.is_any_addr = tcp_xinfo_is_any_addr,
 	.family = AF_INET,
@@ -837,11 +869,40 @@ static void load_xinfo_from_proc_inet_L4(ino_t netns_inode, const char *proc_fil
 	fclose(tcp_fp);
 }
 
-static void load_xinfo_from_proc_tcp(ino_t netns_inode)
+static void handle_diag_tcp(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	load_xinfo_from_proc_inet_L4(netns_inode,
-				     "/proc/net/tcp",
-				     &tcp_xinfo_class);
+	const struct inet_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
+
+	struct tcp_xinfo *ux;
+	struct inet_xinfo *inet;
+	struct sock_xinfo *sock;
+
+	ux = xcalloc(1, sizeof(*ux));
+	inet = &ux->l4.inet;
+	sock = &inet->sock;
+	sock->class = &tcp_xinfo_class.sock;
+	sock->netns_inode = netns_inode;
+	sock->inode = (ino_t) diag->idiag_inode;
+	ux->local_port = be16_to_cpu(diag->id.idiag_sport);
+	ux->remote_port = be16_to_cpu(diag->id.idiag_dport);
+	ux->l4.st = diag->idiag_state;
+	memcpy(&inet->local_addr.s_addr, &diag->id.idiag_src, 4);
+	memcpy(&inet->remote_addr.s_addr, &diag->id.idiag_dst, 4);
+
+	add_sock_info(sock);
+}
+
+static void load_xinfo_from_diag_tcp(int netlink_fd, ino_t netns_inode)
+{
+	struct inet_diag_req_v2 udr = {
+		.sdiag_family = AF_INET,
+		.sdiag_protocol = IPPROTO_TCP,
+		.idiag_states = -1,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_tcp);
 }
 
 /*
@@ -905,18 +966,46 @@ static const struct l4_xinfo_class udp_xinfo_class = {
 		.fill_column = udp_fill_column,
 		.free = NULL,
 	},
-	.scan_line = tcp_xinfo_scan_line,
 	.get_addr = tcp_xinfo_get_addr,
 	.is_any_addr = tcp_xinfo_is_any_addr,
 	.family = AF_INET,
 	.l3_decorator = {"", ""},
 };
 
-static void load_xinfo_from_proc_udp(ino_t netns_inode)
+static void handle_diag_udp(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	load_xinfo_from_proc_inet_L4(netns_inode,
-				     "/proc/net/udp",
-				     &udp_xinfo_class);
+	const struct inet_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
+
+	struct tcp_xinfo *ux;
+	struct inet_xinfo *inet;
+	struct sock_xinfo *sock;
+
+	ux = xcalloc(1, sizeof(*ux));
+	inet = &ux->l4.inet;
+	sock = &inet->sock;
+	sock->class = &udp_xinfo_class.sock;
+	sock->netns_inode = netns_inode;
+	sock->inode = (ino_t) diag->idiag_inode;
+	ux->local_port = be16_to_cpu(diag->id.idiag_sport);
+	ux->remote_port = be16_to_cpu(diag->id.idiag_dport);
+	ux->l4.st = diag->idiag_state;
+	memcpy(&inet->local_addr.s_addr, &diag->id.idiag_src, 4);
+	memcpy(&inet->remote_addr.s_addr, &diag->id.idiag_dst, 4);
+
+	add_sock_info(sock);
+}
+
+static void load_xinfo_from_diag_udp(int netlink_fd, ino_t netns_inode)
+{
+	struct inet_diag_req_v2 udr = {
+		.sdiag_family = AF_INET,
+		.sdiag_protocol = IPPROTO_UDP,
+		.idiag_states = -1,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_udp);
 }
 
 /*
@@ -943,18 +1032,46 @@ static const struct l4_xinfo_class udplite_xinfo_class = {
 		.fill_column = udplite_fill_column,
 		.free = NULL,
 	},
-	.scan_line = tcp_xinfo_scan_line,
 	.get_addr = tcp_xinfo_get_addr,
 	.is_any_addr = tcp_xinfo_is_any_addr,
 	.family = AF_INET,
 	.l3_decorator = {"", ""},
 };
 
-static void load_xinfo_from_proc_udplite(ino_t netns_inode)
+static void handle_diag_udplite(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	load_xinfo_from_proc_inet_L4(netns_inode,
-				     "/proc/net/udplite",
-				     &udplite_xinfo_class);
+	const struct inet_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
+
+	struct tcp_xinfo *ux;
+	struct inet_xinfo *inet;
+	struct sock_xinfo *sock;
+
+	ux = xcalloc(1, sizeof(*ux));
+	inet = &ux->l4.inet;
+	sock = &inet->sock;
+	sock->class = &udplite_xinfo_class.sock;
+	sock->netns_inode = netns_inode;
+	sock->inode = (ino_t) diag->idiag_inode;
+	ux->local_port = be16_to_cpu(diag->id.idiag_sport);
+	ux->remote_port = be16_to_cpu(diag->id.idiag_dport);
+	ux->l4.st = diag->idiag_state;
+	memcpy(&inet->local_addr.s_addr, &diag->id.idiag_src, 4);
+	memcpy(&inet->remote_addr.s_addr, &diag->id.idiag_dst, 4);
+
+	add_sock_info(sock);
+}
+
+static void load_xinfo_from_diag_udplite(int netlink_fd, ino_t netns_inode)
+{
+	struct inet_diag_req_v2 udr = {
+		.sdiag_family = AF_INET,
+		.sdiag_protocol = IPPROTO_UDPLITE,
+		.idiag_states = -1,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_udplite);
 }
 
 /*
@@ -1072,18 +1189,46 @@ static const struct l4_xinfo_class raw_xinfo_class = {
 		.fill_column = raw_fill_column,
 		.free = NULL,
 	},
-	.scan_line = raw_xinfo_scan_line,
 	.get_addr = tcp_xinfo_get_addr,
 	.is_any_addr = tcp_xinfo_is_any_addr,
 	.family = AF_INET,
 	.l3_decorator = {"", ""},
 };
 
-static void load_xinfo_from_proc_raw(ino_t netns_inode)
+static void handle_diag_raw(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	load_xinfo_from_proc_inet_L4(netns_inode,
-				     "/proc/net/raw",
-				     &raw_xinfo_class);
+	const struct inet_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
+
+	struct tcp_xinfo *ux;
+	struct inet_xinfo *inet;
+	struct sock_xinfo *sock;
+
+	ux = xcalloc(1, sizeof(*ux));
+	inet = &ux->l4.inet;
+	sock = &inet->sock;
+	sock->class = &raw_xinfo_class.sock;
+	sock->netns_inode = netns_inode;
+	sock->inode = (ino_t) diag->idiag_inode;
+	ux->local_port = be16_to_cpu(diag->id.idiag_sport);
+	ux->remote_port = be16_to_cpu(diag->id.idiag_dport);
+	ux->l4.st = diag->idiag_state;
+	memcpy(&inet->local_addr.s_addr, &diag->id.idiag_src, 4);
+	memcpy(&inet->remote_addr.s_addr, &diag->id.idiag_dst, 4);
+
+	add_sock_info(sock);
+}
+
+static void load_xinfo_from_diag_raw(int netlink_fd, ino_t netns_inode)
+{
+	struct inet_diag_req_v2 udr = {
+		.sdiag_family = AF_INET,
+		.sdiag_protocol = IPPROTO_RAW,
+		.idiag_states = -1,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_raw);
 }
 
 /*
@@ -1147,50 +1292,6 @@ static void load_xinfo_from_proc_icmp(ino_t netns_inode)
 /*
  * TCP6
  */
-static struct sock_xinfo *tcp6_xinfo_scan_line(const struct sock_xinfo_class *class,
-					       char * line,
-					       ino_t netns_inode,
-					       enum sysfs_byteorder byteorder)
-{
-	uint32_t local_addr[4];
-	unsigned int local_port;
-	uint32_t remote_addr[4];
-	unsigned int remote_port;
-	unsigned int st;
-	unsigned long inode;
-	struct tcp_xinfo *tcp;
-	struct inet6_xinfo *inet6;
-	struct sock_xinfo *sock;
-
-	if (sscanf(line,
-		   "%*d: "
-		   "%08x%08x%08x%08x:%04x "
-		   "%08x%08x%08x%08x:%04x "
-		   "%x %*x:%*x %*x:%*x %*x %*u %*d %lu ",
-		   local_addr+0, local_addr+1, local_addr+2, local_addr+3, &local_port,
-		   remote_addr+0, remote_addr+1, remote_addr+2, remote_addr+3, &remote_port,
-		   &st, &inode) != 12)
-		return NULL;
-
-	if (inode == 0)
-		return NULL;
-
-	tcp = xmalloc(sizeof(*tcp));
-	inet6 = &tcp->l4.inet6;
-	sock = &inet6->sock;
-	sock->class = class;
-	sock->inode = (ino_t)inode;
-	sock->netns_inode = netns_inode;
-	tcp->local_port = local_port;
-	for (int i = 0; i < 4; i++) {
-		inet6->local_addr.s6_addr32[i] = kernel32_to_cpu(byteorder, local_addr[i]);
-		inet6->remote_addr.s6_addr32[i] = kernel32_to_cpu(byteorder, remote_addr[i]);
-	}
-	tcp->remote_port = remote_port;
-	tcp->l4.st = st;
-
-	return sock;
-}
 
 static bool tcp6_fill_column(struct proc *proc  __attribute__((__unused__)),
 			     struct sock_xinfo *sock_xinfo,
@@ -1225,18 +1326,46 @@ static const struct l4_xinfo_class tcp6_xinfo_class = {
 		.fill_column = tcp6_fill_column,
 		.free = NULL,
 	},
-	.scan_line = tcp6_xinfo_scan_line,
 	.get_addr = tcp6_xinfo_get_addr,
 	.is_any_addr = tcp6_xinfo_is_any_addr,
 	.family = AF_INET6,
 	.l3_decorator = {"[", "]"},
 };
 
-static void load_xinfo_from_proc_tcp6(ino_t netns_inode)
+static void handle_diag_tcp6(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	load_xinfo_from_proc_inet_L4(netns_inode,
-				     "/proc/net/tcp6",
-				     &tcp6_xinfo_class);
+	const struct inet_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
+
+	struct tcp_xinfo *ux;
+	struct inet6_xinfo *inet;
+	struct sock_xinfo *sock;
+
+	ux = xcalloc(1, sizeof(*ux));
+	inet = &ux->l4.inet6;
+	sock = &inet->sock;
+	sock->class = &tcp6_xinfo_class.sock;
+	sock->netns_inode = netns_inode;
+	sock->inode = (ino_t) diag->idiag_inode;
+	ux->local_port = be16_to_cpu(diag->id.idiag_sport);
+	ux->remote_port = be16_to_cpu(diag->id.idiag_dport);
+	ux->l4.st = diag->idiag_state;
+	memcpy(&inet->local_addr, &diag->id.idiag_src, 16);
+	memcpy(&inet->remote_addr, &diag->id.idiag_dst, 16);
+
+	add_sock_info(sock);
+}
+
+static void load_xinfo_from_diag_tcp6(int netlink_fd, ino_t netns_inode)
+{
+	struct inet_diag_req_v2 udr = {
+		.sdiag_family = AF_INET6,
+		.sdiag_protocol = IPPROTO_TCP,
+		.idiag_states = -1,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_tcp6);
 }
 
 /*
@@ -1263,18 +1392,46 @@ static const struct l4_xinfo_class udp6_xinfo_class = {
 		.fill_column = udp6_fill_column,
 		.free = NULL,
 	},
-	.scan_line = tcp6_xinfo_scan_line,
 	.get_addr = tcp6_xinfo_get_addr,
 	.is_any_addr = tcp6_xinfo_is_any_addr,
 	.family = AF_INET6,
 	.l3_decorator = {"[", "]"},
 };
 
-static void load_xinfo_from_proc_udp6(ino_t netns_inode)
+static void handle_diag_udp6(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	load_xinfo_from_proc_inet_L4(netns_inode,
-				     "/proc/net/udp6",
-				     &udp6_xinfo_class);
+	const struct inet_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
+
+	struct tcp_xinfo *ux;
+	struct inet6_xinfo *inet;
+	struct sock_xinfo *sock;
+
+	ux = xcalloc(1, sizeof(*ux));
+	inet = &ux->l4.inet6;
+	sock = &inet->sock;
+	sock->class = &udp6_xinfo_class.sock;
+	sock->netns_inode = netns_inode;
+	sock->inode = (ino_t) diag->idiag_inode;
+	ux->local_port = be16_to_cpu(diag->id.idiag_sport);
+	ux->remote_port = be16_to_cpu(diag->id.idiag_dport);
+	ux->l4.st = diag->idiag_state;
+	memcpy(&inet->local_addr, &diag->id.idiag_src, 16);
+	memcpy(&inet->remote_addr, &diag->id.idiag_dst, 16);
+
+	add_sock_info(sock);
+}
+
+static void load_xinfo_from_diag_udp6(int netlink_fd, ino_t netns_inode)
+{
+	struct inet_diag_req_v2 udr = {
+		.sdiag_family = AF_INET6,
+		.sdiag_protocol = IPPROTO_UDP,
+		.idiag_states = -1,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_udp6);
 }
 
 /*
@@ -1301,18 +1458,46 @@ static const struct l4_xinfo_class udplite6_xinfo_class = {
 		.fill_column = udplite6_fill_column,
 		.free = NULL,
 	},
-	.scan_line = tcp6_xinfo_scan_line,
 	.get_addr = tcp6_xinfo_get_addr,
 	.is_any_addr = tcp6_xinfo_is_any_addr,
 	.family = AF_INET6,
 	.l3_decorator = {"[", "]"},
 };
 
-static void load_xinfo_from_proc_udplite6(ino_t netns_inode)
+static void handle_diag_udplite6(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	load_xinfo_from_proc_inet_L4(netns_inode,
-				     "/proc/net/udplite6",
-				     &udplite6_xinfo_class);
+	const struct inet_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
+
+	struct tcp_xinfo *ux;
+	struct inet6_xinfo *inet;
+	struct sock_xinfo *sock;
+
+	ux = xcalloc(1, sizeof(*ux));
+	inet = &ux->l4.inet6;
+	sock = &inet->sock;
+	sock->class = &udplite6_xinfo_class.sock;
+	sock->netns_inode = netns_inode;
+	sock->inode = (ino_t) diag->idiag_inode;
+	ux->local_port = be16_to_cpu(diag->id.idiag_sport);
+	ux->remote_port = be16_to_cpu(diag->id.idiag_dport);
+	ux->l4.st = diag->idiag_state;
+	memcpy(&inet->local_addr, &diag->id.idiag_src, 16);
+	memcpy(&inet->remote_addr, &diag->id.idiag_dst, 16);
+
+	add_sock_info(sock);
+}
+
+static void load_xinfo_from_diag_udplite6(int netlink_fd, ino_t netns_inode)
+{
+	struct inet_diag_req_v2 udr = {
+		.sdiag_family = AF_INET6,
+		.sdiag_protocol = IPPROTO_UDPLITE,
+		.idiag_states = -1,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_udplite6);
 }
 
 /*
@@ -1392,18 +1577,46 @@ static const struct l4_xinfo_class raw6_xinfo_class = {
 		.fill_column = raw6_fill_column,
 		.free = NULL,
 	},
-	.scan_line = raw6_xinfo_scan_line,
 	.get_addr = tcp6_xinfo_get_addr,
 	.is_any_addr = tcp6_xinfo_is_any_addr,
 	.family = AF_INET6,
 	.l3_decorator = {"[", "]"},
 };
 
-static void load_xinfo_from_proc_raw6(ino_t netns_inode)
+static void handle_diag_raw6(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	load_xinfo_from_proc_inet_L4(netns_inode,
-				     "/proc/net/raw6",
-				     &raw6_xinfo_class);
+	const struct inet_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
+
+	struct tcp_xinfo *ux;
+	struct inet6_xinfo *inet;
+	struct sock_xinfo *sock;
+
+	ux = xcalloc(1, sizeof(*ux));
+	inet = &ux->l4.inet6;
+	sock = &inet->sock;
+	sock->class = &raw6_xinfo_class.sock;
+	sock->netns_inode = netns_inode;
+	sock->inode = (ino_t) diag->idiag_inode;
+	ux->local_port = be16_to_cpu(diag->id.idiag_sport);
+	ux->remote_port = be16_to_cpu(diag->id.idiag_dport);
+	ux->l4.st = diag->idiag_state;
+	memcpy(&inet->local_addr, &diag->id.idiag_src, 16);
+	memcpy(&inet->remote_addr, &diag->id.idiag_dst, 16);
+
+	add_sock_info(sock);
+}
+
+static void load_xinfo_from_diag_raw6(int netlink_fd, ino_t netns_inode)
+{
+	struct inet_diag_req_v2 udr = {
+		.sdiag_family = AF_INET6,
+		.sdiag_protocol = IPPROTO_RAW,
+		.idiag_states = -1,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_raw6);
 }
 
 /*
@@ -1574,49 +1787,47 @@ static const struct sock_xinfo_class netlink_xinfo_class = {
 	.free = NULL,
 };
 
-static void load_xinfo_from_proc_netlink(ino_t netns_inode)
+static void handle_diag_netlink(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	char line[BUFSIZ];
-	FILE *netlink_fp;
+	const struct netlink_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
 
-	netlink_fp = fopen("/proc/net/netlink", "r");
-	if (!netlink_fp)
-		return;
+	assert(diag->ndiag_family == AF_NETLINK);
+	size_t rta_len = nlmsg_len - NLMSG_LENGTH(sizeof(*diag));
 
-	if (fgets(line, sizeof(line), netlink_fp) == NULL)
-		goto out;
-	if (!(line[0] == 's' && line[1] == 'k'))
-		/* Unexpected line */
-		goto out;
+	struct netlink_xinfo *nl;
 
-	while (fgets(line, sizeof(line), netlink_fp)) {
-		uint16_t protocol;
-		uint32_t lportid;
-		uint32_t groups;
-		unsigned long inode;
-		struct netlink_xinfo *nl;
+	nl = xcalloc(1, sizeof(*nl));
+	nl->sock.class = &netlink_xinfo_class;
+	nl->sock.inode = (ino_t)diag->ndiag_ino;
+	nl->sock.netns_inode = netns_inode;
 
-		if (sscanf(line, "%*x %" SCNu16 " %" SCNu32 " %" SCNx32 " %*d %*d %*d %*d %*u %lu",
-			   &protocol, &lportid, &groups, &inode) < 4)
-			continue;
+	nl->protocol = diag->ndiag_protocol;
+	nl->lportid = diag->ndiag_portid;
 
-		if (inode == 0)
-			continue;
-
-		nl = xcalloc(1, sizeof(*nl));
-		nl->sock.class = &netlink_xinfo_class;
-		nl->sock.inode = (ino_t)inode;
-		nl->sock.netns_inode = netns_inode;
-
-		nl->protocol = protocol;
-		nl->lportid = lportid;
-		nl->groups = groups;
-
-		add_sock_info(&nl->sock);
+	for (struct rtattr *attr = (struct rtattr *)(diag + 1); RTA_OK(attr, rta_len); attr = RTA_NEXT(attr, rta_len)) {
+		switch (attr->rta_type) {
+		case NETLINK_DIAG_GROUPS:
+			size_t x = RTA_PAYLOAD(attr);
+			long *y = RTA_DATA(attr);
+			assert(x == sizeof(*y));
+			nl->groups = *y;
+		}
 	}
 
- out:
-	fclose(netlink_fp);
+	add_sock_info(&nl->sock);
+}
+
+static void load_xinfo_from_diag_netlink(int netlink_fd, ino_t netns_inode)
+{
+	struct netlink_diag_req udr = {
+		.sdiag_family = AF_NETLINK,
+		.sdiag_protocol = -1,
+		.ndiag_show = NDIAG_SHOW_GROUPS,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_netlink);
 }
 
 /*
@@ -1979,44 +2190,43 @@ static const struct sock_xinfo_class packet_xinfo_class = {
 	.free = NULL,
 };
 
-static void load_xinfo_from_proc_packet(ino_t netns_inode)
+static void handle_diag_packet(ino_t netns_inode, size_t nlmsg_len, void *d)
 {
-	char line[BUFSIZ];
-	FILE *packet_fp;
+	const struct packet_diag_msg *diag = d;
+	if (nlmsg_len < NLMSG_LENGTH(sizeof(*diag)))
+		exit(19);
 
-	packet_fp = fopen("/proc/net/packet", "r");
-	if (!packet_fp)
-		return;
+	assert(diag->pdiag_family == AF_PACKET);
+	size_t rta_len = nlmsg_len - NLMSG_LENGTH(sizeof(*diag));
 
-	if (fgets(line, sizeof(line), packet_fp) == NULL)
-		goto out;
-	if (!(line[0] == 's' && line[1] == 'k'))
-		/* Unexpected line */
-		goto out;
+	struct packet_xinfo *ux;
 
-	while (fgets(line, sizeof(line), packet_fp)) {
-		uint16_t type;
-		uint16_t protocol;
-		unsigned int iface;
-		unsigned long inode;
-		struct packet_xinfo *pkt;
+	ux = xcalloc(1, sizeof(*ux));
+	ux->sock.class = &packet_xinfo_class;
+	ux->sock.netns_inode = netns_inode;
+	ux->sock.inode = (ino_t) diag->pdiag_ino;
+	ux->type = diag->pdiag_type;
+	ux->protocol = diag->pdiag_num;
 
-		if (sscanf(line, "%*x %*d %" SCNu16 " %" SCNu16 " %u %*d %*d %*d %lu",
-			   &type, &protocol, &iface, &inode) < 4)
-			continue;
-
-		pkt = xcalloc(1, sizeof(*pkt));
-		pkt->sock.class = &packet_xinfo_class;
-		pkt->sock.inode = (ino_t)inode;
-		pkt->sock.netns_inode = netns_inode;
-
-		pkt->type = type;
-		pkt->protocol = protocol;
-		pkt->iface = iface;
-
-		add_sock_info(&pkt->sock);
+	for (struct rtattr *attr = (struct rtattr *)(diag + 1); RTA_OK(attr, rta_len); attr = RTA_NEXT(attr, rta_len)) {
+		switch (attr->rta_type) {
+		case PACKET_DIAG_INFO:
+			size_t x = RTA_PAYLOAD(attr);
+			struct packet_diag_info *info = RTA_DATA(attr);
+			assert(x == sizeof(*info));
+			ux->iface = info->pdi_index;
+		}
 	}
 
- out:
-	fclose(packet_fp);
+	add_sock_info(&ux->sock);
+}
+
+static void load_xinfo_from_diag_packet(int netlink_fd, ino_t netns_inode)
+{
+	struct packet_diag_req udr = {
+		.sdiag_family = AF_PACKET,
+		.pdiag_show = PACKET_SHOW_INFO,
+	};
+
+	send_diag_request(netns_inode, netlink_fd, &udr, sizeof(udr), handle_diag_packet);
 }

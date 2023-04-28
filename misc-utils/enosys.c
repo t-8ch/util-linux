@@ -69,6 +69,7 @@ struct syscall {
 };
 
 static const struct syscall syscalls[] = {
+	/* sorted alphabetically */
 #define UL_SYSCALL(name, nr) { name, nr },
 #include "syscalls.h"
 #undef UL_SYSCALL
@@ -94,10 +95,32 @@ static void __attribute__((__noreturn__)) usage(void)
 	exit(EXIT_SUCCESS);
 }
 
+struct syscall_group {
+	const char *const name;
+	long *numbers;
+};
+
+#define NO_SYSCALL (-1)
+#define SYSCALL_GROUP(name, ...) { name, (long[]){ __VA_ARGS__, NO_SYSCALL } }
+
+static const struct syscall_group syscall_groups[] = {
+	/* sorted alphabetically */
+	SYSCALL_GROUP("new_mount", __NR_fsopen, __NR_move_mount, __NR_open_tree),
+};
+
+static const char *syscall_name(long number)
+{
+	for (size_t i = 0; i < ARRAY_SIZE(syscalls); i++) {
+		if (syscalls[i].number == number)
+			return syscalls[i].name;
+	}
+	return NULL;
+}
+
 int main(int argc, char **argv)
 {
 	int c;
-	size_t i;
+	size_t i, j;
 	bool found;
 	static const struct option longopts[] = {
 		{ "syscall", required_argument, NULL, 's' },
@@ -113,11 +136,23 @@ int main(int argc, char **argv)
 		switch (c) {
 		case 's':
 			found = 0;
-			for (i = 0; i < ARRAY_SIZE(syscalls); i++) {
-				if (strcmp(optarg, syscalls[i].name) == 0) {
-					blocked_syscalls[i] = true;
-					found = 1;
-					break;
+			if (optarg[0] == '@') {
+				for (i = 0; i < ARRAY_SIZE(syscall_groups); i++) {
+					if (strcmp(optarg + 1, syscall_groups[i].name) == 0) {
+						found = 1;
+
+						for (j = 0; syscall_groups[i].numbers[j] != NO_SYSCALL; j++)
+							blocked_syscalls[syscall_groups[i].numbers[j]] = true;
+						break;
+					}
+				}
+			} else {
+				for (i = 0; i < ARRAY_SIZE(syscalls); i++) {
+					if (strcmp(optarg, syscalls[i].name) == 0) {
+						found = 1;
+						blocked_syscalls[i] = true;
+						break;
+					}
 				}
 			}
 			if (!found)
@@ -126,6 +161,13 @@ int main(int argc, char **argv)
 		case 'l':
 			for (i = 0; i < ARRAY_SIZE(syscalls); i++)
 				printf("%s\n", syscalls[i].name);
+			for (i = 0; i < ARRAY_SIZE(syscall_groups); i++) {
+				printf("@%s: ", syscall_groups[i].name);
+				for (j = 0; syscall_groups[i].numbers[j] != NO_SYSCALL; j++) {
+					printf("%s ", syscall_name(syscall_groups[i].numbers[j]));
+				}
+				printf("\n");
+			}
 			return EXIT_SUCCESS;
 		case 'V':
 			print_version(EXIT_SUCCESS);

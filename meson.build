@@ -2849,6 +2849,7 @@ exe = executable(
   install : true)
 if not is_disabler(exe)
   exes += exe
+  manadocs += ['misc-utils/enosys.1.adoc']
   bashcompletions += ['enosys']
 endif
 

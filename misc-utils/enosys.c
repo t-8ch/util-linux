@@ -24,6 +24,7 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 #include <linux/audit.h>
+#include <linux/fs.h>
 #include <sys/prctl.h>
 
 #include "c.h"
@@ -62,6 +63,7 @@
 
 #define syscall_nr (offsetof(struct seccomp_data, nr))
 #define syscall_arch (offsetof(struct seccomp_data, arch))
+#define syscall_arg(n) (offsetof(struct seccomp_data, args[n]))
 
 struct syscall {
 	const char *const name;
@@ -75,6 +77,11 @@ static const struct syscall syscalls[] = {
 #undef UL_SYSCALL
 };
 static_assert(sizeof(syscalls) > 0, "no syscalls found");
+
+static const struct syscall ioctls[] = {
+	{ "FITHAW", FITHAW },
+};
+static_assert(sizeof(ioctls) > 0, "no ioctls found");
 
 static void __attribute__((__noreturn__)) usage(void)
 {
@@ -124,6 +131,7 @@ int main(int argc, char **argv)
 	bool found;
 	static const struct option longopts[] = {
 		{ "syscall", required_argument, NULL, 's' },
+		{ "ioctl",   required_argument, NULL, 'i' },
 		{ "list",    no_argument,       NULL, 'l' },
 		{ "version", no_argument,       NULL, 'V' },
 		{ "help",    no_argument,       NULL, 'h' },
@@ -131,8 +139,9 @@ int main(int argc, char **argv)
 	};
 
 	bool blocked_syscalls[ARRAY_SIZE(syscalls)] = {};
+	bool blocked_ioctls[ARRAY_SIZE(ioctls)] = {};
 
-	while ((c = getopt_long (argc, argv, "Vhs:l", longopts, NULL)) != -1) {
+	while ((c = getopt_long (argc, argv, "Vhs:i:l", longopts, NULL)) != -1) {
 		switch (c) {
 		case 's':
 			found = 0;
@@ -158,6 +167,18 @@ int main(int argc, char **argv)
 			if (!found)
 				errx(EXIT_FAILURE, _("Unknown syscall '%s'"), optarg);
 			break;
+		case 'i':
+			found = 0;
+			for (i = 0; i < ARRAY_SIZE(ioctls); i++) {
+				if (strcmp(optarg, ioctls[i].name) == 0) {
+					found = 1;
+					blocked_ioctls[i] = true;
+					break;
+				}
+			}
+			if (!found)
+				errx(EXIT_FAILURE, _("Unknown ioctl '%s'"), optarg);
+			break;
 		case 'l':
 			for (i = 0; i < ARRAY_SIZE(syscalls); i++)
 				printf("%s\n", syscalls[i].name);
@@ -181,30 +202,46 @@ int main(int argc, char **argv)
 	if (optind >= argc)
 		errtryhelp(EXIT_FAILURE);
 
-#define N_FILTERS (ARRAY_SIZE(syscalls) * 2 + 5)
+#define N_FILTERS (ARRAY_SIZE(syscalls) * 2 + ARRAY_SIZE(ioctls) * 2 + 8)
 
-	struct sock_filter filter[N_FILTERS] = {
-		[0] = BPF_STMT(BPF_LD | BPF_W | BPF_ABS, syscall_arch),
-		[1] = BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SECCOMP_ARCH_NATIVE, 1, 0),
-		[2] = BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP),
-		[3] = BPF_STMT(BPF_LD | BPF_W | BPF_ABS, syscall_nr),
-
-		[N_FILTERS - 1] = BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
-	};
+	struct sock_filter filter[N_FILTERS];
 	static_assert(ARRAY_SIZE(filter) <= BPF_MAXINSNS, "bpf filter too big");
 
-	for (i = 0; i < ARRAY_SIZE(syscalls); i++) {
-		struct sock_filter *f = &filter[4 + i * 2];
+	struct sock_filter *f = filter;
 
-		*f = (struct sock_filter) BPF_JUMP(
+	*f++ = (struct sock_filter) BPF_STMT(BPF_LD | BPF_W | BPF_ABS, syscall_arch);
+	*f++ = (struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, SECCOMP_ARCH_NATIVE, 1, 0);
+	*f++ = (struct sock_filter) BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_TRAP);
+	*f++ = (struct sock_filter) BPF_STMT(BPF_LD | BPF_W | BPF_ABS, syscall_nr);
+
+	for (i = 0; i < ARRAY_SIZE(syscalls); i++) {
+		*f++ = (struct sock_filter) BPF_JUMP(
 				BPF_JMP | BPF_JEQ | BPF_K,
 				syscalls[i].number,
 				0, 1);
-		*(f + 1) = blocked_syscalls[i]
+		*f++ = blocked_syscalls[i]
 			? (struct sock_filter) BPF_STMT(
 					BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOSYS)
 			: UL_BPF_NOP;
 	}
+
+	*f++ = (struct sock_filter) BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_ioctl, 1, 0);
+	*f++ = (struct sock_filter) BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
+
+	*f++ = (struct sock_filter) BPF_STMT(BPF_LD | BPF_W | BPF_ABS, syscall_arg(1));
+
+	for (i = 0; i < ARRAY_SIZE(ioctls); i++) {
+		*f++ = (struct sock_filter) BPF_JUMP(
+				BPF_JMP | BPF_JEQ | BPF_K,
+				ioctls[i].number,
+				0, 1);
+		*f++ = blocked_ioctls[i]
+			? (struct sock_filter) BPF_STMT(
+					BPF_RET | BPF_K, SECCOMP_RET_ERRNO | ENOTTY)
+			: UL_BPF_NOP;
+	}
+
+	*f++ = (struct sock_filter) BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW);
 
 	struct sock_fprog prog = {
 		.len    = ARRAY_SIZE(filter),

@@ -22,7 +22,7 @@ ts_init "$*"
 
 ts_check_test_command "$TS_CMD_ENOSYS"
 ts_check_test_command "$TS_CMD_FALLOCATE"
-ts_check_test_command "$TS_CMD_FSFREEZE"
+ts_check_test_command "$TS_CMD_PIPESZ"
 
 "$TS_CMD_ENOSYS" true 2> /dev/null
 [ "$?" -eq "$TS_EXIT_NOTSUPP" ] && ts_skip "enosys does not work"
@@ -40,8 +40,10 @@ ts_finalize_subtest
 
 ts_init_subtest ioctl
 
-"$TS_CMD_FSFREEZE" --unfreeze / > /dev/null 2>> "$TS_ERRLOG"
-"$TS_CMD_ENOSYS" -i FITHAW -- "$TS_CMD_FSFREEZE" --unfreeze / > /dev/null 2>> "$TS_OUTPUT"
+PIPESZ_TEST="echo -n | $TS_CMD_PIPESZ --check --set 4096 --stdin"
+
+$PIPESZ_TEST > /dev/null 2>> "$TS_ERRLOG"
+"$TS_CMD_ENOSYS" -i FIFREEZE -- "$TS_CMD_FSFREEZE" --unfreeze / > /dev/null 2>> "$TS_OUTPUT"
 
 ts_finalize_subtest
 

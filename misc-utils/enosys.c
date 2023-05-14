@@ -26,6 +26,7 @@
 #include <linux/audit.h>
 #include <linux/fs.h>
 #include <sys/prctl.h>
+#include <sys/ioctl.h>
 
 #include "c.h"
 #include "exitcodes.h"
@@ -79,7 +80,10 @@ static const struct syscall syscalls[] = {
 static_assert(sizeof(syscalls) > 0, "no syscalls found");
 
 static const struct syscall ioctls[] = {
+	{ "FIFREEZE", FIFREEZE },
 	{ "FITHAW", FITHAW },
+	{ "FIONREAD", FIONREAD },
+	{ "TIOCGWINSZ", TIOCGWINSZ },
 };
 static_assert(sizeof(ioctls) > 0, "no ioctls found");
 
